@@ -1,0 +1,258 @@
+# import
+import csv
+import json
+import logging
+# easy_install.exe requests
+import requests
+import unittest
+import datetime
+# pip3 install numpy
+import numpy as np
+# pip3 install pandas
+import pandas as pd
+# pip3 install elasticsearch
+import elasticsearch
+from configparser import ConfigParser
+from elasticsearch import helpers, Elasticsearch, ElasticsearchException, exceptions
+
+###Configuration
+# read ES config file
+parser = ConfigParser()
+parser.read('C:/Users/gzvxion/Documents/My Received Files/Python/ES Config.ini')
+print('\nRead Config File Successfully!!!\n')
+
+# localhost
+url = parser.get('ES Connection','url')
+
+#csv file
+tb_file = parser.get('File Path','tb_file')
+tb_path = parser.get('File Path','tb_path')
+
+cl_file = parser.get('File Path','cl_file')
+cl_path = parser.get('File Path','cl_path')
+
+# csv dtype
+tb_dtype= {"id": int, "Storage Type": str,"Source System": str,"Schema": str,"Table Name":str,"Table Description":str,
+           "Schedule":str,"Row Count": int,"Data As Of Date":str,"Load Date": str,"Data Domain":str}
+            
+cl_dtype = {'id': int, 'Table Name':str, 'Column Name': str,'Data Type': str,
+            'Business Description':str, 'Data Domain': str}
+          
+# md_table_indx setting
+tb_indx = parser.get('Index','tb_indx')
+tb_type = parser.get('Index','tb_type')
+tb_setting = {
+        'mappings': {
+            'table': {
+                'properties': {
+                    'id': {'type': 'integer'},
+                    'Storage Type': {'type': 'string'},
+                    'Source System': { 'type': 'string'},
+                    'Schema': { 'type': 'string'},
+                    'Table Name': {'type': 'string'},
+                    'Table Description': {'type': 'string'},
+                    'Schedule': {'type': 'string'},
+                    'Row Count': {'type': 'integer'},
+                    'Data As Of Date': {"format": "yyyy-MM-dd",'type': 'date'},
+                    'Load Date': {"format": "yyyy-MM-dd", 'type': 'date' },
+                    'Data Domain': {'type': 'string'},
+                }
+            }
+        }
+}
+
+# md_attributes_indx setting
+att_indx = parser.get('Index','att_indx')
+att_type = parser.get('Index','att_type')
+att_setting = {
+    'mappings': {
+        'attributes': {
+            'properties': {
+                    'id': {'type': 'integer'},
+                    'Table Name': {'type': 'string'},
+                    'Column Name': {'type': 'string'},
+                    'Data Type': {'type': 'string'},
+                    'Business Description': {'type': 'string'},
+                    'Data Domain': {'type': 'string'}
+            }
+        }
+    }
+}
+
+# set up logger
+logger = logging.getLogger("Elasticsearch")
+
+### Elasticsearch Connection
+# log 1: Exception: elasticsearch not runing 
+try:
+    # connect to Elasticsearch
+    es = Elasticsearch(url)
+    res = requests.get(url)
+
+    # print response on json format
+    print("\n" + json.dumps(json.loads(res.content),sort_keys=True, indent=4))
+
+except exceptions.ConnectionError as e:
+    logger.exception("\nElasticsearch not running on %r" % url, exc_info = True)
+    raise unittest.SkipTest("Elasticsearch not running on %r" % url, e) 
+
+### For md_table_indx
+## Read CSV
+# log 2: Exception: Wrong Data Type 
+
+# ignore SettingwithCopyWarning
+pd.set_option('mode.chained_assignment', None)
+
+try:
+    table_df = pd.read_csv(tb_path, dtype = tb_dtype)
+        
+    # Data As Of Date, Load Date: convert string to date
+    table_df['Data As Of Date'] =(pd.to_datetime(table_df['Data As Of Date'])).dt.date
+    table_df['Load Date'] = (pd.to_datetime(table_df['Load Date'])).dt.date
+        
+    n_tb_row = table_df.shape[0]
+        
+    # Data domain : convert string to list
+    for i in range(n_tb_row):
+        table_df['Data Domain'][i] = table_df['Data Domain'][i].split(",")
+
+    print("\nRead %r Sucessfully!!!\n" %tb_file)
+
+except:
+    logger.exception("Error: Wrong data type!" , exc_info = True)
+    raise TypeError           
+
+# check table_df 
+print("\n Data Frame: ",tb_file)
+print(table_df.head())
+
+# mandatory fields of table_df
+tb_mandatory_field = ['Storage Type','Source System','Schema','Table Name','Table Description']
+tb_mandatory_isnull = []
+
+# check if mandotory fields contain null 
+for field in tb_mandatory_field:
+    tb_mandatory_isnull.append(table_df[field].isnull().values.any()) 
+print("\nMandotory fileds of Table_TB_metdata are null? ", tb_mandatory_isnull)
+
+# insert data to table index function
+def insertToTBIndex():
+  # log 4: Exception: missing values in mandatory field 
+  if all(x == False for x in tb_mandatory_isnull):
+
+    bulk_data = []
+    
+    # iterate each row, insert as document to ES
+    for index, row in table_df.iterrows():
+        data_dict = {}
+        for i in range(len(row)):
+            data_dict[table_df.columns[i]] = row[i] #end nested loop
+        op_dict = {
+            "index": {
+                "_index": tb_indx,
+                "_type": tb_type,
+                "_id": data_dict['id']
+            }
+        }
+        bulk_data.append(op_dict)
+        bulk_data.append(data_dict) # end loop
+
+    es.bulk(index = tb_indx, body = bulk_data)
+  else:
+    logger.exception("\nError: Mandatory fields contain missing value!")
+    raise elasticsearch.exceptions.RequestError    #illegal_argument_exception
+
+# if index not exist, create one
+if (es.indices.exists(index = tb_indx)== False):
+    # create md_table_indx
+    es.indices.create(index = tb_indx, body = tb_setting)
+    print("\n%r is created!!!" %tb_indx)
+    # then insert data to index
+    insertToTBIndex()
+    
+# if index exist, add data to existing index
+else:
+    insertToTBIndex()
+
+# search md_table_indx
+tb_search_res = es.search(body={"query": {"match_all": {}}}, index = tb_indx, sort = 'id',size = 1000)
+print("Search md_table_indx:\n")
+print(tb_search_res)
+
+### For md_attributes_indx
+# log 5: Exception: wrong data type
+try:     
+    col_df = pd.read_csv(cl_path, dtype = cl_dtype)
+    
+    n_cl_row = col_df.shape[0]
+    
+    # Data domain : convert string to list
+    for i in range(n_cl_row):
+        col_df['Data Domain'][i] = col_df['Data Domain'][i].split(",")
+        
+    print("\nRead %r sucessfully!!!\n" %cl_file)
+except:
+    logger.exception("\nError: Wrong data type!", exc_info = True)
+    raise TypeError
+
+# check col_df 
+print("\n Data Frame: ",cl_file)
+print(col_df.head())
+
+cl_mandatory_field = ['Table Name','Column Name','Data Type','Business Description']
+cl_mandatory_isnull = []
+
+# check if mandotory fields contain null 
+for field in cl_mandatory_field:
+    cl_mandatory_isnull.append(col_df[field].isnull().values.any())
+print("\nMandotory fileds of Columns_TB_metdata are null?\n ",cl_mandatory_isnull)
+
+# insert data to index function
+def insertToAttIndex():
+  # log 4: Exception: missing values in mandatory field 
+  if all(x == False for x in cl_mandatory_isnull):
+
+    bulkLst = []
+    
+    # iterate each row, insert as document to ES
+    for index, row in col_df.iterrows():
+        body_dict = {}
+        for i in range(len(row)):
+            body_dict[col_df.columns[i]] = row[i] #end nested loop
+        head_dict = {
+            "index": {
+                "_index": att_indx,
+                "_type": att_type,
+                "_id": body_dict['id']
+            }
+        }
+        bulkLst.append(head_dict)
+        bulkLst.append(body_dict) # end loop
+
+    es.bulk(index = att_indx, body = bulkLst)
+  else:
+    logger.exception("\nError: Mandatory fields contain missing value!")
+    raise elasticsearch.exceptions.RequestError    #illegal_argument_exception
+
+# if index not exist, create one
+if (es.indices.exists(index = att_indx)== False):
+    # create md_table_indx
+    es.indices.create(index = att_indx, body = att_setting)
+    print("\n%r is created!!!" %att_indx)
+    # then insert data to index
+    insertToAttIndex() 
+# if index exist, add data to existing index
+else:
+    insertToAttIndex()
+
+# search md_attributes_indx
+att_search_res = es.search(body={"query": {"match_all": {}}}, index = att_indx, sort = 'id',size = 1000)
+print("Search md_attributs_indx:\n")
+print(att_search_res)
+
+# get all indexes created
+print('\n All Indexs:\n ')
+for index in es.indices.get('*'):
+    print(index)
+
+
